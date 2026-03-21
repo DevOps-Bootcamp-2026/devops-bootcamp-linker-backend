@@ -1,67 +1,86 @@
-#--- Build Stage ---
-FROM node:20-alpine AS builder
+# We use node:slim (Debian-based) instead of Alpine because
+# Prisma's native query engine binaries require glibc, which Alpine lacks.
+ARG NODE=node:20-slim
+
+# =============================================================
+# STAGE 1: BUILD
+# Install deps, generate Prisma client, compile TypeScript
+# =============================================================
+FROM $NODE AS builder
 
 WORKDIR /app
 
-# Install build dependencies
-RUN apk add --no-cache \
+# Install system packages needed at build time:
+#   python3, build-essential → native npm addon compilation
+#   openssl                  → required by Prisma client generation
+RUN apt-get update && apt-get install -y \
     python3 \
-    build-base \
-    openssl
+    build-essential \
+    openssl \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy and install ALL dependencies (dev + prod)
-COPY package*.json ./
-RUN npm ci
+# Install pnpm globally — the linker backend uses pnpm, not npm.
+# We pin the version for reproducibility.
+RUN npm install -g pnpm@9
 
-# Copy source and build
+# Copy manifest files first for Docker layer caching.
+# Docker only re-runs pnpm install when these change.
+COPY package.json pnpm-lock.yaml ./
+
+# --frozen-lockfile = equivalent of npm ci
+# Fails if pnpm-lock.yaml is out of sync with package.json
+RUN pnpm install --frozen-lockfile
+
+# Copy source code and the Prisma schema
 COPY . .
 
-# Generate Prisma client before building the app
-RUN npx prisma generate
+# Generate the Prisma Client from your schema.
+# This creates type-safe DB access code in node_modules/@prisma/client.
+# MUST run before the TypeScript build because NestJS imports it.
+RUN pnpm exec prisma generate
 
-RUN npm run build
+# Compile TypeScript → JavaScript into ./dist/
+RUN pnpm run build
 
-
-#--- Production Stage ---
-FROM node:20-alpine AS runner
-
-# Set environment
-ENV NODE_ENV=production \
-    PORT=3001
+# =============================================================
+# STAGE 2: PRODUCTION IMAGE
+# Copy only what is needed to run — no dev dependencies
+# =============================================================
+FROM $NODE AS runner
 
 WORKDIR /app
 
-# Install runtime dependencies only
-RUN apk add --no-cache openssl curl
+# Runtime system packages:
+#   openssl → Prisma needs it at runtime to connect to the database
+#   curl    → useful for health checks
+RUN apt-get update && apt-get install -y \
+    openssl \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user explicitly
-# node user already exists in node:alpine
-# but let's be explicit about ownership
-RUN chown -R node:node /app
+# Install pnpm in the production image to run pnpm install --prod
+RUN npm install -g pnpm@9
 
-# Copy package files for runtime module resolution
-COPY --from=builder --chown=node:node /app/package*.json ./
+# Copy manifest to install prod-only deps
+COPY package.json pnpm-lock.yaml ./
 
-# Install ONLY production dependencies here
-# instead of copying all node_modules from builder
-RUN npm ci --only=production && \
-    npm cache clean --force
+# --prod skips devDependencies, keeping the final image lean
+RUN pnpm install --frozen-lockfile --prod
 
-COPY --from=builder --chown=node:node /app/node_modules ./node_modules
+# Copy the compiled NestJS application from the builder stage
+COPY --from=builder /app/dist ./dist
 
-# Copy Prisma client and schema for runtime use
-COPY --from=builder --chown=node:node /app/prisma ./prisma/
+# Copy the Prisma Client and its native engine binary.
+# The engine binary is platform-specific and must match the runtime OS.
+COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
+COPY --from=builder /app/node_modules/@prisma ./node_modules/@prisma
 
-# Copy built application
-COPY --from=builder --chown=node:node /app/dist ./dist
-COPY entrypoint-script.sh ./entrypoint-script.sh 
-RUN  chown node:node ./entrypoint-script.sh 
-RUN chmod +x entrypoint-script.sh
+# Copy the Prisma schema (needed for migrations at runtime if desired)
+COPY --from=builder /app/prisma ./prisma
 
-# Switch to non-root user
+# 'node' is a built-in non-root user in the official Node.js Docker images
 USER node
 
-# Document port
 EXPOSE 3001
 
-CMD ["./entrypoint-script.sh"]
+CMD ["node", "dist/main.js"]

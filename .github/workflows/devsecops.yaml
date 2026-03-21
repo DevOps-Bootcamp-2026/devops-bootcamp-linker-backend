@@ -1,0 +1,179 @@
+name: DevSecOps Pipeline
+
+# =============================================================
+# TRIGGERS
+# Runs on Pull Requests to main — catches issues BEFORE merge.
+# =============================================================
+on:
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - '.github/workflows/**'
+      - '**/*.md'
+
+# =============================================================
+# JOBS
+# =============================================================
+jobs:
+
+  # -----------------------------------------------------------
+  # JOB 1: Slack notification when a PR is opened/updated
+  # -----------------------------------------------------------
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Slack Notification on PR
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_CHANNEL: github-notifications
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_TITLE: "🔐 Linker Backend – DevSecOps Pipeline"
+          SLACK_MESSAGE: |
+            **Event**: ${{ github.actor }} opened a ${{ github.event_name }}!
+            **Repository**: ${{ github.event.pull_request.html_url }}
+            **Branch**: ${{ github.ref_name }}
+            **PR Title**: ${{ github.event.pull_request.title }}
+          MSG_MINIMAL: true
+          SLACKIFY_MARKDOWN: true
+
+  # -----------------------------------------------------------
+  # JOB 2: Lint — ESLint on changed TS/JS files only
+  # -----------------------------------------------------------
+  lint:
+    name: Lint Code
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          clean: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+
+      # The backend uses pnpm — install it before anything else
+      - name: Install pnpm
+        run: npm install -g pnpm@9
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@v42
+        with:
+          files: |
+            **/*.js
+            **/*.jsx
+            **/*.ts
+            **/*.tsx
+
+      - name: Run ESLint on changed files
+        if: steps.changed-files.outputs.any_changed == 'true'
+        run: npx eslint ${{ steps.changed-files.outputs.all_changed_files }} --max-warnings=0
+
+      - name: Skip lint (no JS/TS files changed)
+        if: steps.changed-files.outputs.any_changed != 'true'
+        run: echo "No JS/TS files changed — skipping lint."
+
+  # -----------------------------------------------------------
+  # JOB 3: SCA — check pnpm dependencies for known CVEs
+  # pnpm audit uses the same npm advisory database as npm audit
+  # -----------------------------------------------------------
+  sca:
+    name: Software Composition Analysis
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+
+      - name: Install pnpm
+        run: npm install -g pnpm@9
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # pnpm audit --json writes a report; jq then fails the step
+      # if any high or critical advisories are present.
+      # || true prevents pnpm audit's own non-zero exit from hiding the jq result.
+      - name: Run pnpm audit (SCA)
+        run: |
+          pnpm audit --json | tee pnpm-audit-report.json || true
+          cat pnpm-audit-report.json | \
+          jq -e '
+            (.advisories | to_entries | map(
+              select(.value.severity == "high" or .value.severity == "critical")
+            ) | length) == 0
+          '
+
+      - name: Upload SCA report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sca-report-linker-backend
+          path: pnpm-audit-report.json
+
+  # -----------------------------------------------------------
+  # JOB 4: SAST — scan source code for security anti-patterns
+  # -----------------------------------------------------------
+  sast:
+    name: SAST – Semgrep
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    container:
+      image: semgrep/semgrep
+
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Semgrep
+        run: semgrep scan --error --json-output=semgrep-results.json
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+      - name: Upload Semgrep report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: semgrep-report-linker-backend
+          path: semgrep-results.json
+
+      - name: Slack – Pipeline Failed
+        if: ${{ failure() }}
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_COLOR: ${{ job.status }}
+          SLACK_MESSAGE_ON_FAILURE: "❌ Linker Backend DevSecOps Pipeline FAILED!"
+
+      - name: Slack – Pipeline Passed
+        if: ${{ success() }}
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_COLOR: ${{ job.status }}
+          SLACK_MESSAGE_ON_SUCCESS: "✅ Linker Backend DevSecOps Pipeline passed!"
+
+      - name: Slack – Report Link
+        if: always()
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_COLOR: ${{ job.status }}
+          SLACK_MESSAGE_ON_SUCCESS: "📋 Reports: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          SLACK_MESSAGE_ON_FAILURE: "📋 Reports: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          SLACK_MSG_AUTHOR: ${{ github.actor }}
+          MSG_MINIMAL: true
