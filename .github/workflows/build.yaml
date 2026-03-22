@@ -1,0 +1,129 @@
+# =============================================================
+# PIPELINE NAME
+# =============================================================
+name: Docker Build, Scan and Push
+
+# =============================================================
+# TRIGGERS
+# =============================================================
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - ".github/workflows/**"
+      - "**/*.md"
+
+# =============================================================
+# GLOBAL ENV VARS
+# =============================================================
+env:
+  DOCKER_REPO: cloudbwoy       # ← CHANGE THIS
+  IMAGE_NAME: devops-bootcamp-linker-backend   # ← change if desired
+
+# =============================================================
+# JOBS
+# =============================================================
+jobs:
+
+  # -----------------------------------------------------------
+  # JOB 1: Notify Slack that the pipeline has started
+  # -----------------------------------------------------------
+  slack-notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Slack Notification – Pipeline Started
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_TITLE: "🚀 Linker Backend – Docker Build Triggered"
+          SLACK_MESSAGE: |
+            **Event:** ${{ github.event_name }}
+            **Actor:** ${{ github.actor }}
+            **Branch:** ${{ github.ref_name }}
+            **Commit:** ${{ github.event.head_commit.message }}
+
+  # -----------------------------------------------------------
+  # JOB 2: Build → Scan → Push
+  # -----------------------------------------------------------
+  build-scan-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKER_REPO }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      # Generate a unique tag from the short Git commit SHA
+      - name: Generate Docker image tag
+        id: tag
+        uses: docker/metadata-action@v5
+        with:
+          images: docker.io/${{ env.DOCKER_REPO }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=short
+
+      # Build locally first so Trivy can scan it before it is pushed
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          load: true
+          tags: ${{ steps.tag.outputs.tags }}
+
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin
+
+      # Fail the pipeline if any HIGH or CRITICAL CVEs are found
+      - name: Scan image for vulnerabilities
+        run: |
+          trivy image \
+            --format table \
+            --exit-code 1 \
+            --ignore-unfixed \
+            --severity CRITICAL,HIGH \
+            "${{ steps.tag.outputs.tags }}" \
+            | tee trivy-report.txt
+
+      # Save the scan report even if the scan failed
+      - name: Upload Trivy scan report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report-linker-backend
+          path: trivy-report.txt
+
+      # Only push if the Trivy scan passed (exit code 0)
+      - name: Push image to Docker Hub
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.tag.outputs.tags }}
+
+      - name: Slack Notification – Pipeline Result
+        if: always()
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_COLOR: ${{ job.status }}
+          SLACK_MESSAGE: |
+            Docker pipeline **${{ job.status }}**
+            Actor: ${{ github.actor }}
+            Repository: ${{ github.repository }}
+            Logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
