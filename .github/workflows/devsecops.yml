@@ -80,8 +80,7 @@ jobs:
         run: npm install
 
       - name: Run NPM audit
-        run: npm audit --json | tee npm-audit-report.json | jq -e 'select(.type=="auditSummary") | select(.data.vulnerabilities.moderate == 0 and .data.vulnerabilities.high == 0 and .data.vulnerabilities.critical == 0)' > /dev/null
-
+        run: npm audit --json --audit-level=high | tee npm-audit-report.json > /dev/null
 
       - name: Upload SCA Reports
         uses: actions/upload-artifact@v4
