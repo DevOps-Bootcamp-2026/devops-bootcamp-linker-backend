@@ -32,7 +32,8 @@ ENV NODE_ENV=production \
 WORKDIR /app
 
 # Install runtime dependencies only
-RUN apk add --no-cache openssl curl
+RUN apk add --no-cache openssl curl ca-certificates && \
+    update-ca-certificates
 
 # Create non-root user explicitly
 # node user already exists in node:alpine
